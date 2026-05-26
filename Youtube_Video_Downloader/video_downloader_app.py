@@ -23,7 +23,7 @@ from tkinter import PhotoImage, filedialog, messagebox
 from yt_dlp.utils import DownloadCancelled
 
 APP_NAME = "Clipzy"
-APP_VERSION = "2026.3"
+APP_VERSION = "2026.1.0"
 APP_DIR = Path(__file__).parent.resolve()
 DATA_DIR = Path(os.getenv("LOCALAPPDATA", str(APP_DIR))) / "Clipzy"
 HISTORY_FILE = DATA_DIR / "history.json"
@@ -77,7 +77,8 @@ class ClipzyApp(ctk.CTk):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-        self.ffmpeg_path = self._resolve_ffmpeg_path()
+        self.ffmpeg_path: str | None = None
+        self._ffmpeg_probe_started = False
         self.status_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
 
         self.download_queue: list[dict[str, Any]] = []
@@ -118,13 +119,29 @@ class ClipzyApp(ctk.CTk):
         self._ensure_icon_file()
         self._apply_window_icon()
         self._build_ui()
-        self._load_brand_images()
         self._refresh_queue_text()
         self._refresh_history()
         self._set_controls_enabled(True)
 
+        # Defer heavier startup tasks until after first paint for faster app open.
+        self.after(20, self._deferred_startup)
+
         self.after(130, self._drain_status_queue)
         self.after(130, self._animate_ui)
+
+    def _deferred_startup(self) -> None:
+        self._load_brand_images()
+        self._start_ffmpeg_probe()
+
+    def _start_ffmpeg_probe(self) -> None:
+        if self._ffmpeg_probe_started:
+            return
+        self._ffmpeg_probe_started = True
+
+        def worker() -> None:
+            self.ffmpeg_path = self._resolve_ffmpeg_path()
+
+        threading.Thread(target=worker, daemon=True).start()
 
     @staticmethod
     def _resolve_ffmpeg_path() -> str | None:
@@ -215,7 +232,7 @@ class ClipzyApp(ctk.CTk):
             pass
 
         try:
-            if self.logo_path and self.logo_path.exists():
+            if self.logo_path and self.logo_path.exists() and not ICON_FILE.exists():
                 self.tk_window_icon = PhotoImage(file=str(self.logo_path))
                 self.iconphoto(True, self.tk_window_icon)
         except Exception:
@@ -448,6 +465,16 @@ class ClipzyApp(ctk.CTk):
         )
         self.preview_help.grid(row=5, column=1, padx=(0, 12), pady=(2, 14), sticky="ew")
 
+        self.download_preview_btn = ctk.CTkButton(
+            self.preview_tab,
+            text="Download This Preview",
+            height=36,
+            command=self._download_current_preview,
+            fg_color="#16a34a",
+            hover_color="#22c55e",
+        )
+        self.download_preview_btn.grid(row=6, column=1, padx=(0, 12), pady=(0, 14), sticky="ew")
+
     def _build_queue_tab(self) -> None:
         self.queue_tab.grid_columnconfigure(0, weight=1)
         self.queue_tab.grid_rowconfigure(1, weight=1)
@@ -582,6 +609,26 @@ class ClipzyApp(ctk.CTk):
         url = self.url_var.get().strip()
         self._add_queue_items([url] if url else [])
 
+    def _download_current_preview(self) -> None:
+        if self.processing:
+            messagebox.showerror(APP_NAME, "A queue is already running. Wait for it to finish or cancel it first.")
+            return
+        if self.analyzing:
+            messagebox.showerror(APP_NAME, "Preview is still loading. Please wait a moment.")
+            return
+        if not self.info_cache:
+            messagebox.showerror(APP_NAME, "No preview loaded. Click Generate Preview first.")
+            return
+
+        preview_url = str(self.info_cache.get("url") or "").strip()
+        if not preview_url:
+            messagebox.showerror(APP_NAME, "Preview URL is missing. Please generate preview again.")
+            return
+
+        self._add_queue_items([preview_url])
+        self.tabs.set("Queue")
+        self._start_queue()
+
     def _add_batch_to_queue(self) -> None:
         text = self.batch_box.get("1.0", "end").strip()
         if text == "Paste one URL per line":
@@ -632,6 +679,7 @@ class ClipzyApp(ctk.CTk):
             self.apply_preset_btn,
             self.clear_done_btn,
             self.clear_queue_btn,
+            self.download_preview_btn,
         ):
             widget.configure(state=state)
         action_state = "normal" if self.processing else "disabled"
@@ -724,6 +772,7 @@ class ClipzyApp(ctk.CTk):
 
             thumb = self._download_thumbnail_bytes(info)
             self.info_cache = {
+                "url": url,
                 "title": info.get("title") or "Untitled",
                 "channel": info.get("uploader") or info.get("channel") or "-",
                 "duration": info.get("duration"),
@@ -818,6 +867,9 @@ class ClipzyApp(ctk.CTk):
         self.cancel_all_event.clear()
         self.pause_event.clear()
         self.pause_btn.configure(text="Pause")
+        if self.ffmpeg_path is None:
+            # If background probe has not finished yet, resolve once here.
+            self.ffmpeg_path = self._resolve_ffmpeg_path()
         self.progress.set(0.0)
         self._set_controls_enabled(False)
         self.status_var.set("Queue started.")
